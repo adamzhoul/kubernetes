@@ -551,6 +551,9 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 	if err != nil {
 		return nil, err
 	}
+	// Avoid collector collects it as a timestamped metric
+	// See PR #95210 and #97006 for more details.
+	machineInfo.Timestamp = time.Time{}
 	klet.setCachedMachineInfo(machineInfo)
 
 	imageBackOff := flowcontrol.NewBackOff(backOffPeriod, MaxContainerBackOff)
@@ -628,6 +631,10 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 	}
 	klet.runtimeCache = runtimeCache
 
+	// common provider to get host file system usage associated with a pod managed by kubelet
+	hostStatsProvider := stats.NewHostStatsProvider(kubecontainer.RealOS{}, func(podUID types.UID) string {
+		return getEtcHostsPath(klet.getPodDir(podUID))
+	})
 	if kubeDeps.useLegacyCadvisorStats {
 		klet.StatsProvider = stats.NewCadvisorStatsProvider(
 			klet.cadvisor,
@@ -635,7 +642,8 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 			klet.podManager,
 			klet.runtimeCache,
 			klet.containerRuntime,
-			klet.statusManager)
+			klet.statusManager,
+			hostStatsProvider)
 	} else {
 		klet.StatsProvider = stats.NewCRIStatsProvider(
 			klet.cadvisor,
@@ -644,8 +652,7 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 			klet.runtimeCache,
 			kubeDeps.RemoteRuntimeService,
 			kubeDeps.RemoteImageService,
-			stats.NewLogMetricsService(),
-			kubecontainer.RealOS{})
+			hostStatsProvider)
 	}
 
 	klet.pleg = pleg.NewGenericPLEG(klet.containerRuntime, plegChannelCapacity, plegRelistPeriod, klet.podCache, clock.RealClock{})
@@ -740,9 +747,8 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 	klet.backOff = flowcontrol.NewBackOff(backOffPeriod, MaxContainerBackOff)
 	klet.podKiller = NewPodKiller(klet)
 
-	etcHostsPathFunc := func(podUID types.UID) string { return getEtcHostsPath(klet.getPodDir(podUID)) }
 	// setup eviction manager
-	evictionManager, evictionAdmitHandler := eviction.NewManager(klet.resourceAnalyzer, evictionConfig, killPodNow(klet.podWorkers, kubeDeps.Recorder), klet.podManager.GetMirrorPodByPod, klet.imageManager, klet.containerGC, kubeDeps.Recorder, nodeRef, klet.clock, etcHostsPathFunc)
+	evictionManager, evictionAdmitHandler := eviction.NewManager(klet.resourceAnalyzer, evictionConfig, killPodNow(klet.podWorkers, kubeDeps.Recorder), klet.podManager.GetMirrorPodByPod, klet.imageManager, klet.containerGC, kubeDeps.Recorder, nodeRef, klet.clock)
 
 	klet.evictionManager = evictionManager
 	klet.admitHandlers.AddPodAdmitHandler(evictionAdmitHandler)

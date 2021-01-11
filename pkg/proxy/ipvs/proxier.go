@@ -18,6 +18,7 @@ package ipvs
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -803,13 +804,9 @@ func cleanupIptablesLeftovers(ipt utiliptables.Interface) (encounteredError bool
 }
 
 // CleanupLeftovers clean up all ipvs and iptables rules created by ipvs Proxier.
-func CleanupLeftovers(ipvs utilipvs.Interface, ipt utiliptables.Interface, ipset utilipset.Interface, cleanupIPVS bool) (encounteredError bool) {
-	if cleanupIPVS {
-		// Return immediately when ipvs interface is nil - Probably initialization failed in somewhere.
-		if ipvs == nil {
-			return true
-		}
-		encounteredError = false
+func CleanupLeftovers(ipvs utilipvs.Interface, ipt utiliptables.Interface, ipset utilipset.Interface) (encounteredError bool) {
+	// Clear all ipvs rules
+	if ipvs != nil {
 		err := ipvs.Flush()
 		if err != nil {
 			klog.Errorf("Error flushing IPVS rules: %v", err)
@@ -2011,9 +2008,12 @@ func (proxier *Proxier) syncService(svcName string, vs *utilipvs.VirtualServer, 
 
 func (proxier *Proxier) syncEndpoint(svcPortName proxy.ServicePortName, onlyNodeLocalEndpoints bool, vs *utilipvs.VirtualServer) error {
 	appliedVirtualServer, err := proxier.ipvs.GetVirtualServer(vs)
-	if err != nil || appliedVirtualServer == nil {
+	if err != nil {
 		klog.Errorf("Failed to get IPVS service, error: %v", err)
 		return err
+	}
+	if appliedVirtualServer == nil {
+		return errors.New("IPVS virtual service does not exist")
 	}
 
 	// curEndpoints represents IPVS destinations listed from current system.

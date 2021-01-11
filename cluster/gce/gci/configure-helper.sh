@@ -1266,18 +1266,11 @@ EOF
   fi
 }
 
-# Create kubeconfig files for control plane components.
 function create-kubeconfig {
   local component=$1
   local token=$2
   echo "Creating kubeconfig file for component ${component}"
   mkdir -p "/etc/srv/kubernetes/${component}"
-
-  local kube_apiserver="localhost"
-  if [[ ${KUBECONFIG_USE_HOST_IP:-} == "true" ]] ; then
-    kube_apiserver=$(hostname -i)
-  fi
-  
   cat <<EOF >"/etc/srv/kubernetes/${component}/kubeconfig"
 apiVersion: v1
 kind: Config
@@ -1289,7 +1282,7 @@ clusters:
 - name: local
   cluster:
     insecure-skip-tls-verify: true
-    server: https://${kube_apiserver}:443
+    server: https://localhost:443
 contexts:
 - context:
     cluster: local
@@ -1458,6 +1451,14 @@ function create-master-etcd-apiserver-auth {
      ETCD_APISERVER_CLIENT_CERT_PATH="${auth_dir}/etcd-apiserver-client.crt"
      echo "${ETCD_APISERVER_CLIENT_CERT}" | base64 --decode | gunzip > "${ETCD_APISERVER_CLIENT_CERT_PATH}"
    fi
+}
+
+function docker-installed {
+    if systemctl cat docker.service &> /dev/null ; then
+        return 0
+    else
+        return 1
+    fi
 }
 
 function assemble-docker-flags {
@@ -1718,7 +1719,8 @@ function prepare-etcd-manifest {
   local etcd_apiserver_creds="${ETCD_APISERVER_CREDS:-}"
   local etcd_extra_args="${ETCD_EXTRA_ARGS:-}"
   local suffix="$1"
-  local etcd_livenessprobe_port="$2"
+  local etcd_listen_metrics_port="$2"
+  local etcdctl_certs=""
 
   if [[ -n "${INITIAL_ETCD_CLUSTER_STATE:-}" ]]; then
     cluster_state="${INITIAL_ETCD_CLUSTER_STATE}"
@@ -1731,9 +1733,10 @@ function prepare-etcd-manifest {
   # mTLS should only be enabled for etcd server but not etcd-events. if $1 suffix is empty, it's etcd server.
   if [[ -z "${suffix}" && -n "${ETCD_APISERVER_CA_KEY:-}" && -n "${ETCD_APISERVER_CA_CERT:-}" && -n "${ETCD_APISERVER_SERVER_KEY:-}" && -n "${ETCD_APISERVER_SERVER_CERT:-}" && -n "${ETCD_APISERVER_CLIENT_KEY:-}" && -n "${ETCD_APISERVER_CLIENT_CERT:-}" ]]; then
     etcd_apiserver_creds=" --client-cert-auth --trusted-ca-file ${ETCD_APISERVER_CA_CERT_PATH} --cert-file ${ETCD_APISERVER_SERVER_CERT_PATH} --key-file ${ETCD_APISERVER_SERVER_KEY_PATH} "
+    etcdctl_certs="--cacert ${ETCD_APISERVER_CA_CERT_PATH} --cert ${ETCD_APISERVER_CLIENT_CERT_PATH} --key ${ETCD_APISERVER_CLIENT_KEY_PATH}"
     etcd_apiserver_protocol="https"
-    etcd_livenessprobe_port="2382"
-    etcd_extra_args+=" --listen-metrics-urls=http://${ETCD_LISTEN_CLIENT_IP:-127.0.0.1}:${etcd_livenessprobe_port} "
+    etcd_listen_metrics_port="2382"
+    etcd_extra_args+=" --listen-metrics-urls=http://${ETCD_LISTEN_CLIENT_IP:-127.0.0.1}:${etcd_listen_metrics_port} "
   fi
 
   if [[ -n "${ETCD_PROGRESS_NOTIFY_INTERVAL:-}" ]]; then
@@ -1787,9 +1790,9 @@ function prepare-etcd-manifest {
   sed -i -e "s@{{ *etcd_protocol *}}@$etcd_protocol@g" "${temp_file}"
   sed -i -e "s@{{ *etcd_apiserver_protocol *}}@$etcd_apiserver_protocol@g" "${temp_file}"
   sed -i -e "s@{{ *etcd_creds *}}@$etcd_creds@g" "${temp_file}"
+  sed -i -e "s@{{ *etcdctl_certs *}}@$etcdctl_certs@g" "${temp_file}"
   sed -i -e "s@{{ *etcd_apiserver_creds *}}@$etcd_apiserver_creds@g" "${temp_file}"
   sed -i -e "s@{{ *etcd_extra_args *}}@$etcd_extra_args@g" "${temp_file}"
-  sed -i -e "s@{{ *etcd_livenessprobe_port *}}@$etcd_livenessprobe_port@g" "${temp_file}"
   if [[ -n "${ETCD_VERSION:-}" ]]; then
     sed -i -e "s@{{ *pillar\.get('etcd_version', '\(.*\)') *}}@${ETCD_VERSION}@g" "${temp_file}"
   else
@@ -1987,9 +1990,10 @@ function start-kube-controller-manager {
   prepare-log-file /var/log/kube-controller-manager.log
   # Calculate variables and assemble the command line.
   local params=("${CONTROLLER_MANAGER_TEST_LOG_LEVEL:-"--v=2"}" "${CONTROLLER_MANAGER_TEST_ARGS:-}" "${CLOUD_CONFIG_OPT}")
+  local config_path='/etc/srv/kubernetes/kube-controller-manager/kubeconfig'
   params+=("--use-service-account-credentials")
   params+=("--cloud-provider=gce")
-  params+=("--kubeconfig=/etc/srv/kubernetes/kube-controller-manager/kubeconfig")
+  params+=("--kubeconfig=${config_path}" "--authentication-kubeconfig=${config_path}" "--authorization-kubeconfig=${config_path}")
   params+=("--root-ca-file=${CA_CERT_BUNDLE_PATH}")
   params+=("--service-account-private-key-file=${SERVICEACCOUNT_KEY_PATH}")
   if [[ -n "${ENABLE_GARBAGE_COLLECTOR:-}" ]]; then
@@ -2120,6 +2124,10 @@ function start-kube-scheduler {
       params+=("--policy-config-file=/etc/srv/kubernetes/kube-scheduler/policy-config")
     fi
   fi
+
+  local config_path
+  config_path='/etc/srv/kubernetes/kube-scheduler/kubeconfig'
+  params+=("--authentication-kubeconfig=${config_path}" "--authorization-kubeconfig=${config_path}")
 
   local paramstring
   paramstring="$(convert-manifest-params "${params[*]}")"
@@ -3082,8 +3090,13 @@ function main() {
   if [[ "${container_runtime}" == "docker" ]]; then
     assemble-docker-flags
   elif [[ "${container_runtime}" == "containerd" ]]; then
-    # stop docker if it is present as we want to use just containerd
-    systemctl stop docker || echo "unable to stop docker"
+    if docker-installed; then
+      # We still need to configure docker so it wouldn't reserver the 172.17.0/16 subnet
+      # And if somebody will start docker to build or pull something, logging will also be set up
+      assemble-docker-flags
+      # stop docker if it is present as we want to use just containerd
+      systemctl stop docker || echo "unable to stop docker"
+    fi
     setup-containerd
   fi
 
